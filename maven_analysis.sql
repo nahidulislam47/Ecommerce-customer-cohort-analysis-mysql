@@ -1,0 +1,319 @@
+USE maven_fuzzy_factory; 
+
+-- SECTION 1: TRAFFIC & SESSION TRENDS
+
+-- 1A. Monthly session & order volume trend
+
+
+SELECT
+    MIN(yr_mo) AS first_month,
+MAX(yr_mo) AS last_month,
+MIN(total_sessions) AS min_sessions,
+MAX(total_sessions) AS max_sessions,
+MIN(total_orders) AS min_orders,
+MAX(total_orders) AS max_orders,
+ROUND(MIN(conv_rate_pct),2) AS min_cvr,
+ROUND(MAX(conv_rate_pct),2) AS max_cvr
+FROM (
+    SELECT
+        DATE_FORMAT(ws.created_at, '%Y-%m') AS yr_mo,
+         COUNT(DISTINCT ws.website_session_id) AS total_sessions,
+           COUNT(DISTINCT o.order_id) AS total_orders,
+ ROUND(COUNT(DISTINCT o.order_id) /
+              COUNT(DISTINCT ws.website_session_id) * 100, 2) AS conv_rate_pct
+    FROM website_sessions ws
+    LEFT JOIN orders o ON ws.website_session_id = o.website_session_id
+    GROUP BY yr_mo
+) summary;
+
+SELECT
+    DATE_FORMAT(ws.created_at, '%Y-%m')   AS yr_mo,
+  COUNT(DISTINCT ws.website_session_id)  AS total_sessions,
+       COUNT(DISTINCT o.order_id)  AS total_orders,
+    ROUND(COUNT(DISTINCT o.order_id) /
+          COUNT(DISTINCT ws.website_session_id) * 100, 2) AS conv_rate_pct
+FROM website_sessions ws
+LEFT JOIN orders o
+   ON ws.website_session_id = o.website_session_id
+GROUP BY yr_mo
+ORDER BY yr_mo;
+
+-- 1B. Traffic breakdown by UTM source & campaign
+SELECT
+ utm_source,
+  utm_campaign,
+     COUNT(DISTINCT website_session_id) AS sessions,
+     ROUND(COUNT(DISTINCT website_session_id) * 100.0 /
+          SUM(COUNT(DISTINCT website_session_id)) OVER (), 2) AS pct_of_total
+FROM website_sessions
+GROUP BY utm_source, utm_campaign
+ORDER BY sessions DESC;
+
+-- 1C. Device-type split (mobile vs desktop)
+
+SELECT
+    device_type,
+    COUNT(DISTINCT ws.website_session_id)  AS sessions,
+    COUNT(DISTINCT o.order_id) AS orders,
+       ROUND(COUNT(DISTINCT o.order_id) /
+          COUNT(DISTINCT ws.website_session_id) * 100, 2) AS conv_rate_pct
+FROM website_sessions ws
+LEFT JOIN orders o USING (website_session_id)
+GROUP BY device_type;
+
+-- SECTION 2: CONVERSION FUNNEL ANALYSIS
+
+-- 2A. Full funnel: home → product → cart → shipping → billing → thank-you
+
+WITH funnel AS (
+    SELECT
+        ws.website_session_id,
+        MAX(CASE WHEN pv.pageview_url IN ('/home','/lander-1','/lander-2','/lander-3','/lander-4','/lander-5') THEN 1 ELSE 0 END) AS saw_home,
+        MAX(CASE WHEN pv.pageview_url = '/products' THEN 1 ELSE 0 END) AS saw_products,
+        MAX(CASE WHEN pv.pageview_url LIKE '/the-%' THEN 1 ELSE 0 END) AS saw_product_detail,
+        MAX(CASE WHEN pv.pageview_url = '/cart' THEN 1 ELSE 0 END) AS saw_cart,
+        MAX(CASE WHEN pv.pageview_url = '/shipping' THEN 1 ELSE 0 END) AS saw_shipping,
+        MAX(CASE WHEN pv.pageview_url = '/billing' OR pv.pageview_url = '/billing-2' THEN 1 ELSE 0 END) AS saw_billing,
+        MAX(CASE WHEN pv.pageview_url = '/thank-you-for-your-order' THEN 1 ELSE 0 END) AS converted
+    FROM website_sessions ws
+    JOIN website_pageviews pv USING (website_session_id)
+    GROUP BY ws.website_session_id
+)
+SELECT
+    SUM(saw_home) AS home,
+    SUM(saw_products) AS products,
+    SUM(saw_product_detail) AS product_detail,
+    SUM(saw_cart) AS cart,
+    SUM(saw_shipping) AS shipping,
+    SUM(saw_billing) AS billing,
+    SUM(converted) AS orders,
+    ROUND(SUM(saw_products)/SUM(saw_home)*100, 1) AS home_to_products_pct,
+    ROUND(SUM(saw_product_detail)/SUM(saw_products)*100, 1) AS products_to_detail_pct,
+    ROUND(SUM(saw_cart)/SUM(saw_product_detail)*100, 1) AS detail_to_cart_pct,
+    ROUND(SUM(saw_billing)/SUM(saw_cart)*100, 1) AS cart_to_billing_pct,
+    ROUND(SUM(converted)/SUM(saw_billing)*100, 1) AS billing_to_order_pct
+FROM funnel;
+
+-- 2B. Bounce rate by landing page (single-page sessions)
+WITH FIRST_PV AS (
+SELECT
+WEBSITE_SESSION_ID,
+MIN(WEBSITE_PAGEVIEW_ID) AS MIN_PV_ID
+FROM WEBSITE_PAGEVIEWS
+GROUP BY WEBSITE_SESSION_ID
+),
+LANDING AS (
+SELECT 
+FP.WEBSITE_SESSION_ID,
+PV.PAGEVIEW_URL AS LANDING_PAGE
+FROM FIRST_PV FP
+JOIN WEBSITE_PAGEVIEWS PV ON FP.MIN_PV_ID = PV.WEBSITE_PAGEVIEW_ID
+),
+BOUNCES AS (
+SELECT
+WEBSITE_SESSION_ID,
+COUNT(WEBSITE_PAGEVIEW_ID) AS PV_COUNT
+FROM WEBSITE_PAGEVIEWS
+GROUP BY WEBSITE_SESSION_ID
+HAVING PV_COUNT= 1
+) 
+SELECT 
+l.LANDING_PAGE,
+COUNT(l.WEBSITE_SESSION_ID) AS TOTAL_SESSIONS,
+COUNT(b.WEBSITE_SESSION_ID) AS BOUNCED_SESSIONS,
+ROUND(COUNT(b.WEBSITE_SESSION_ID)/COUNT(l.WEBSITE_SESSION_ID) * 100, 2) AS BOUNCE_RATE_PCT
+FROM LANDING l
+LEFT JOIN BOUNCES b USING ( WEBSITE_SESSION_ID)
+GROUP BY  l.LANDING_PAGE
+ORDER BY TOTAL_SESSIONS DESC;
+
+-- SECTION 3: REVENUE & PRODUCT PERFORMANCE
+
+-- 3A. Product-level revenue, orders, margin
+SELECT
+P.PRODUCT_NAME,
+COUNT(DISTINCT OI.ORDER_ID) AS ORDERS,
+SUM(OI.PRICE_usd) AS GROSS_REVENUE,
+SUM(OI.COGS_usd) AS TOTAL_COGS,
+ROUND(SUM(OI.PRICE_usd)-SUM(OI.COGS_usd),2) AS GROSS_MARGIN,
+ROUND((SUM(OI.PRICE_usd)-SUM(OI.COGS_usd))/SUM(OI.PRICE_usd) * 100,1) AS MARGIN_PCT
+FROM ORDER_ITEMS OI
+JOIN PRODUCTS P USING (PRODUCT_ID)
+GROUP BY PRODUCT_NAME 
+ORDER BY GROSS_REVENUE DESC;
+
+-- 3B.MONTHLY REVENUE TREND (with MoM growth %)
+WITH MONTHLY_REV AS (
+SELECT 
+DATE_FORMAT(CREATED_AT, '%Y-%m' ) AS YR_MO,
+ROUND(SUM(PRICE_usd),2) as REVENUE
+FROM ORDERS
+ GROUP BY YR_MO
+)
+ SELECT 
+ YR_MO,
+ REVENUE,
+ LAG(REVENUE)OVER(ORDER BY YR_MO) AS PREV_MONTH_REV,
+ ROUND((REVENUE-LAG(REVENUE)OVER(ORDER BY YR_MO))/LAG(REVENUE)OVER(ORDER BY YR_MO)* 100,1 ) AS MOM_GROWTH_PCT
+ FROM MONTHLY_REV
+ ORDER BY YR_MO;
+
+-- 3C. Cross-sell analysis – what products are bought together?
+SELECT 
+P1.PRODUCT_NAME AS PRIMARY_PRODUCT,
+p2.PRODUCT_NAME AS CROSS_SELL_PRODUCT,
+COUNT(*) AS TIME_BOUGHT_TOGETHER,
+ROUND(COUNT(*)* 100.0 /COUNT(DISTINCT OI1.ORDER_ID),1) AS ATTACH_RATE_PCT
+FROM ORDER_ITEMS OI1
+JOIN ORDER_ITEMS OI2
+ON OI1.ORDER_ID = OI2.ORDER_ID  
+AND OI1.PRODUCT_ID <> OI2.PRODUCT_ID
+AND OI1.IS_PRIMARY_ITEM = 1
+JOIN PRODUCTS P1 ON OI1.PRODUCT_ID = P1.PRODUCT_ID
+JOIN PRODUCTS P2 ON OI2.PRODUCT_ID = P2.PRODUCT_ID 
+GROUP BY P1.PRODUCT_NAME, P2.PRODUCT_NAME
+ORDER BY TIME_BOUGHT_TOGETHER DESC;
+
+-- SECTION 4: CUSTOMER BEHAVIOUR & REPEAT ANALYSIS
+
+-- 4A. NEW VS REPEAT SESSION BREAKDFOWN BY MONTH
+SELECT
+DATE_FORMAT(CREATED_AT, '%Y-%m' ) AS YR_MO,
+SUM(CASE WHEN IS_REPEAT_SESSION  = 0 THEN 1 ELSE 0 END) AS NEW_SESSIONS,
+SUM(CASE WHEN IS_REPEAT_SESSION = 1 THEN 1 ELSE 0 END) AS REPEAT_SESSIONS,
+ROUND(SUM(IS_REPEAT_SESSION)/COUNT(*)*100,1) AS REPEAT_RATE_PCT
+FROM WEBSITE_SESSIONS
+GROUP BY YR_MO
+ORDER BY YR_MO;
+
+-- 4B. Time between first and second order (repurchase lag)
+WITH USER_ORDERS AS (
+SELECT
+USER_ID,
+CREATED_AT,
+ROW_NUMBER() OVER(PARTITION BY USER_ID ORDER BY CREATED_AT) AS ORDER_NUM
+FROM ORDERS
+),
+FIRST_SECOND AS (
+SELECT
+A.USER_ID,
+DATEDIFF(B.CREATED_AT, A.CREATED_AT) AS DAYS_TO_REPURCHASE
+FROM USER_ORDERS A 
+JOIN USER_ORDERS B
+ON A.USER_ID = B.USER_ID
+AND A.ORDER_NUM = 1 
+AND B.ORDER_NUM = 2
+)
+SELECT
+FLOOR(DAYS_TO_REPURCHASE/30)* 30 AS DAYS_BUCKET,
+COUNT(*) AS CUSTOMERS
+FROM FIRST_SECOND
+GROUP BY DAYS_BUCKET
+ORDER BY DAYS_BUCKET;
+
+-- 4C. CUSTOMER LIFETIME VALUE(CLV)-TOTAL REVENUE PER USER
+SELECT
+USER_ID,
+COUNT(DISTINCT ORDER_ID) AS TOTAL_ORDERS,
+ROUND(SUM(PRICE_usd),2) AS LIFETIME_REVENUE,
+ROUND(AVG(PRICE_usd), 2) AS AVG_ORDER_VALUE,
+MIN(CREATED_AT) AS FIRST_ORDER_DATE,
+MAX(CREATED_AT) AS LAST_ORDER_DATE,
+DATEDIFF(MAX(CREATED_AT),MIN(CREATED_AT)) AS CUSTOMER_LIFESPAN_DAYS
+FROM ORDERS
+GROUP BY USER_ID
+ORDER BY LIFETIME_REVENUE DESC
+LIMIT 20;
+
+-- SECTION 5: REFUND & QUALITY ANALYSIS
+SELECT
+P.PRODUCT_NAME,
+COUNT(DISTINCT OI.ORDER_ITEM_ID) AS ITEMS_SOLD,
+COUNT(DISTINCT R.ORDER_ITEM_REFUND_ID) AS REFUNDS,
+ROUND(COUNT(DISTINCT R.ORDER_ITEM_REFUND_ID)/COUNT(DISTINCT OI.ORDER_ITEM_ID) * 100,2 ) AS REFUND_RATE_PCT,
+ROUND(SUM(R.REFUND_AMOUNT_usd),2) AS TOTAL_REFUND_usd
+FROM ORDER_ITEMS OI
+JOIN PRODUCTS P USING(PRODUCT_ID)
+LEFT JOIN ORDER_ITEM_REFUNDS R USING  (ORDER_ITEM_ID)
+GROUP BY P.PRODUCT_NAME 
+ORDER BY REFUND_RATE_PCT DESC;
+
+-- SECTION 6: MARKETING CHANNEL ROI
+SELECT
+WS.UTM_SOURCE,
+WS.UTM_CAMPAIGN,
+WS.DEVICE_TYPE,
+COUNT(DISTINCT WS.WEBSITE_SESSION_ID) AS SESSIONS,
+COUNT(DISTINCT O.ORDER_ID) AS ORDERS,
+ROUND(COUNT(DISTINCT O.ORDER_ID)/COUNT(DISTINCT WS.WEBSITE_SESSION_ID)*100,2) AS CVR_PCT,
+ROUND(SUM(O.PRICE_usd),2) AS REVENUE,
+ROUND(SUM(O.PRICE_usd)/COUNT(DISTINCT WS.WEBSITE_SESSION_ID) ,2) AS REVENUE_PER_SESSION
+FROM WEBSITE_SESSIONS WS 
+LEFT JOIN ORDERS O USING (WEBSITE_SESSION_ID)
+WHERE WS.UTM_SOURCE IS NOT NULL
+GROUP BY WS.UTM_SOURCE,WS.UTM_CAMPAIGN,WS.DEVICE_TYPE
+ORDER BY REVENUE DESC;
+
+-- SECTION 7: ADVANCED – COHORT RETENTION (monthly)
+
+WITH FIRST_ORDER_MONTH AS (
+SELECT
+USER_ID,
+DATE_FORMAT(MIN(CREATED_AT), '%Y%m') AS COHORT_MONTH
+FROM ORDERS
+GROUP BY USER_ID
+),
+USER_ACTIVITY AS (
+SELECT
+O.USER_ID,
+FO.COHORT_MONTH,
+DATE_FORMAT(O.CREATED_AT,'%Y%m') AS ORDER_MONTH,
+PERIOD_DIFF(
+DATE_FORMAT(O.CREATED_AT,'%Y%m'),
+FO.COHORT_MONTH) AS MONTHS_SINCE_FIRST
+FROM ORDERS O
+JOIN FIRST_ORDER_MONTH FO USING (USER_ID)
+)
+SELECT
+COHORT_MONTH,
+MONTHS_SINCE_FIRST,
+COUNT(DISTINCT USER_ID) AS ACTIVE_USERS
+FROM USER_ACTIVITY
+GROUP BY COHORT_MONTH, MONTHS_SINCE_FIRST
+ORDER BY COHORT_MONTH, MONTHS_SINCE_FIRST;
+ 
+-- SECTION 8: VIEWS FOR REUSE
+
+CREATE OR REPLACE VIEW vw_session_orders AS
+SELECT
+    ws.website_session_id,
+    ws.created_at         AS session_date,
+    ws.user_id,
+    ws.utm_source,
+    ws.utm_campaign,
+    ws.device_type,
+    ws.is_repeat_session,
+    o.order_id,
+    o.price_usd           AS order_revenue,
+    o.cogs_usd            AS order_cogs,
+    ROUND(o.price_usd - o.cogs_usd, 2) AS order_margin
+FROM website_sessions ws
+LEFT JOIN orders o USING (website_session_id);
+
+
+
+
+
+
+ 
+   
+
+
+
+
+
+
+
+
+
+
